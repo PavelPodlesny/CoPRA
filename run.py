@@ -17,7 +17,8 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from pytorch_lightning.callbacks import TQDMProgressBar, EarlyStopping, ModelCheckpoint, ModelSummary
 from pytorch_lightning.strategies.ddp import DDPStrategy
-from pl_modules import ModelModule, DataModule, PretuneModule, DDGModule
+from pl_modules import ModelModule, DataModule
+from data.prepare import precache_dataset
 from collections import defaultdict
 
 torch.set_num_threads(16)
@@ -54,23 +55,17 @@ class LightningRunner(object):
             (output_dir / 'model_data.json').write_text(json.dumps(vars(self.dataset_args), indent=2))
             torch.save(best_model, str(output_dir / 'model.pt'))
     
-    def select_module(self, stage, log_dir):
-        if stage=='pretune':
-            model = PretuneModule(output_dir=log_dir, model_args=self.model_args, data_args=self.dataset_args, run_args=self.run_args)
-        elif stage=='dG':
-            model = ModelModule(output_dir=log_dir, model_args=self.model_args, data_args=self.dataset_args, run_args=self.run_args)
-        elif stage=='ddG':
-            model = DDGModule(output_dir=log_dir, model_args=self.model_args, data_args=self.dataset_args, run_args=self.run_args)
-        else:
-            raise NotImplementedError
-        return model
+    def precache(self):
+        precache_dataset(**self.dataset_args)
 
-    def finetune(self, stage='dG'):
+    def select_module(self, log_dir):
+        return ModelModule(output_dir=log_dir, model_args=self.model_args, data_args=self.dataset_args, run_args=self.run_args)
+
+    def finetune(self):
         print("Run args:", self.run_args, "\n")
         print("Model args:", self.model_args, "\n")
         print("Dataset args:", self.dataset_args, "\n")
         output_dir, gpus = (self.run_args.output_dir, self.run_args.gpus)
-        self.model_args.model.stage = stage
         # Setup datamodule
         run_results = []
         for k in range(self.run_args.num_folds):
@@ -82,7 +77,7 @@ class LightningRunner(object):
             data_module = DataModule(dataset_args=self.dataset_args, **self.dataset_args, col_group=f'fold_{k}')
 
             # Setup model module
-            model = self.select_module(stage, log_dir)
+            model = self.select_module(log_dir)
             # Trainer setting
             name = self.run_args.run_name + time.strftime("%Y-%m-%d-%H-%M-%S")
             if self.run_args.wandb:
@@ -126,7 +121,7 @@ class LightningRunner(object):
         results_df = pd.DataFrame(run_results)
         print(results_df.describe())
 
-    def test(self, stage='dG'):
+    def test(self):
         print("Args:", self.run_args, self.dataset_args, self.model_args)
         output_dir, ckpts, gpus = (self.run_args.output_dir, self.run_args.ckpts,
                                    self.run_args.gpus)
@@ -136,7 +131,7 @@ class LightningRunner(object):
             log_dir = output_dir / f'log_fold_{k}'
             data_module = DataModule(dataset_args=self.dataset_args, **self.dataset_args, col_group=f'fold_{k}')
             # data_module.setup()
-            model = self.select_module(stage, log_dir)
+            model = self.select_module(log_dir)
             logger = CSVLogger(str(log_dir))
             strategy=DDPStrategy(find_unused_parameters=True)
             # strategy.lightning_restore_optimizer = False

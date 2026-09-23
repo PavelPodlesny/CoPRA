@@ -9,7 +9,7 @@ model:
   lora_rank: 16
   lora_alpha: 32
   pair_dim: 40
-  dist_dim: 40
+  energy_embed_dim: 40
   representation_layer: 33
   coformer: 
     embed_dim: 320
@@ -25,7 +25,6 @@ model:
     use_flash_attn: false
 
 train:
-  temperature: 0.2
   max_iters: 30_000
   val_freq: 1000
   seed: 2024

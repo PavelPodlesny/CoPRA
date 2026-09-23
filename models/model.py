@@ -3,12 +3,11 @@ import torch
 import esm
 from rinalmo.config import model_config
 from rinalmo.model.model import RiNALMo
-from models.encoders.pair import ResiduePairEncoder
+from models.encoders.pair import PlainResiduePairEncoder, TokenPoolingResiduePairEncoder
 from models.register import ModelRegister
 from models.components.coformer import CoFormer
 import torch.nn.functional as F
 from models.lora_tune import LoRAESM, LoRARiNALMo, ESMConfig, RiNALMoConfig
-import random
 from data.complex import SUPER_PROT_IDX, SUPER_RNA_IDX, SUPER_CPLX_IDX, SUPER_CHAIN_IDX
 
 from peft import (
@@ -117,13 +116,14 @@ class ESM2RiNALMo(nn.Module):
                  lora_rank=16,
                  lora_alpha=32,
                  representation_layer=33,
-                 dist_dim=40,
+                 energy_embed_dim=40,
                  **kwargs
                  ):
         super(ESM2RiNALMo, self).__init__()
         self.esm, esm_feat_size = load_esm(esm_type)
         self.rinalmo, rinalmo_feat_size = load_rinalmo(rinalmo_weights, rinalmo_type)
-        self.pair_encoder = ResiduePairEncoder(pair_dim, max_num_atoms=4)  # N, CA, C, O,
+        pair_encoder_cls = TokenPoolingResiduePairEncoder if pooling == 'token' else PlainResiduePairEncoder
+        self.pair_encoder = pair_encoder_cls(pair_dim, max_num_atoms=4, energy_embed_dim=energy_embed_dim)  # N, CA, C, O,
         self.c_former = CoFormer(**kwargs['coformer'])
         self.representation_layer = representation_layer
         self.proj = 0
@@ -189,14 +189,8 @@ class ESM2RiNALMo(nn.Module):
             nn.Linear(self.feat_size, self.feat_size), nn.ReLU(),
             nn.Linear(self.feat_size, output_dim)
         )
-        # For mask distance pretraining
-        self.mask_token = nn.Parameter(torch.randn(size=(1, pair_dim)))
-        self.dist_head = nn.Sequential(
-            nn.Linear(pair_dim, self.feat_size), nn.ReLU(),
-            nn.Linear(self.feat_size, dist_dim)
-        )
-    
-    def _forward(self, input, strategy='separate', need_mask=False):
+
+    def _forward(self, input, strategy='separate'):
         prot_input = input['prot']
         prot_chains = input['prot_chains']
         prot_mask = input['protein_mask']
@@ -213,7 +207,7 @@ class ESM2RiNALMo(nn.Module):
         prot_embedding = prot_embedding.float()
         na_embedding = na_embedding.float()
         max_len = input['pos_atoms'].shape[1]
-        # Adjust the embeddings from LMs for CoFormer
+        # Adjust the embeddings from LMs for CoFormer, i.e. padding
         if 'patch_idx' in input:
             patch_idx = input['patch_idx']
         else:
@@ -227,14 +221,17 @@ class ESM2RiNALMo(nn.Module):
             assert out_embedding.shape[0] == input['size']
 
         out_embedding = self.proj_cplx(out_embedding)
-        key_padding_mask = ~masks
+        key_padding_mask = ~masks # True ~ 1 ~ mask/ignore the position 
         
         aa=input['restype']
         res_nb=input['res_nb']
         chain_nb=input['chain_nb']
         pos_atoms=input['pos_atoms']
         mask_atoms=input['mask_atoms']
-        
+        pairwise_dist=input['pairwise_dist']
+        pairwise_dihedral=input['pairwise_dihedral']
+        interface_energy=input['interface_energy']
+
         if self.pooling == 'token':
             mask_special = torch.zeros((len(out_embedding), 1), device=out_embedding.device, dtype=key_padding_mask.dtype)
             cplx_embed = self.complex_embedding.repeat(len(out_embedding), 1, 1)
@@ -267,148 +264,38 @@ class ESM2RiNALMo(nn.Module):
             mask_atom[:,:,0] = 1
             mask_atoms = torch.cat([mask_atom, mask_atom, mask_atom, mask_atoms], dim=1)
 
+        num_special_tokens = self.pair_encoder.num_special_tokens
+        if num_special_tokens > 0:
+            interface_energy = F.pad(interface_energy, (num_special_tokens, 0, num_special_tokens, 0))
 
         z = self.pair_encoder(
             aa=aa,
             res_nb=res_nb,
             chain_nb=chain_nb,
-            pos_atoms=pos_atoms,
             mask_atoms=mask_atoms,
+            pairwise_dist=pairwise_dist,
+            pairwise_dihedral=pairwise_dihedral,
+            interface_energy=interface_energy,
+            pos_atoms_special=pos_atoms if num_special_tokens > 0 else None,
         )
-        if need_mask:
-            # Random mask rows/columns, 50% probability to mask 15% positions, 50% probability to keep the same
-            for i in range(z.shape[0]):
-                to_mask = torch.rand(1).item() > 0.5
-                if not to_mask:
-                    continue
-                valid = list(range(3, z.shape[1]))
-                mask_indices = random.sample(valid, int(len(valid) * 0.15))
-                z[i, mask_indices, :, :] = self.mask_token.repeat(len(mask_indices), z.shape[2], 1)
-                z[i, :, mask_indices, :] = self.mask_token.repeat(z.shape[1], len(mask_indices), 1)
-            
+
         return out_embedding, z, key_padding_mask
-        
-    def forward(self, input, strategy='separate', stage='finetune', need_mask=False):
-        out_embedding, z, key_padding_mask = self._forward(input, strategy, need_mask=need_mask)
-        if stage == 'finetune':
-                
-            output, z, attn = self.c_former(out_embedding, z, key_padding_mask=key_padding_mask, need_attn_weights=False)
 
-            complex_embedding = output + self.z_proj(z).sum(-2) * 0.001
-            if self.pooling == 'token':
-                complex_embedding = output[:, 0, :].squeeze(1)
-            else:
-                complex_embedding = (output * (~key_padding_mask).unsqueeze(-1)).sum(dim=1)
-                if self.pooling == 'mean':
-                    # Prot_mask: [N, L]
-                    seq_mask_sum = (~key_padding_mask).sum(dim=1, keepdim=True)
-                    complex_embedding = complex_embedding / (seq_mask_sum + 1e-10)
+    def forward(self, input, strategy='separate'):
+        out_embedding, z, key_padding_mask = self._forward(input, strategy)
 
-            output = self.pred_head(complex_embedding)
-            output = output.squeeze(1)
-            return output
-            
-        elif stage == 'pretune':
-            # -------------------------------------------CLIP feature generation ----------------------------------------------
-            res_identifier = input['identifier']
-            attn_mask = torch.ones((out_embedding.shape[0], out_embedding.shape[1], out_embedding.shape[1]), device=out_embedding.device).bool()
-            if self.pooling == 'token':
-                prot_token_identifier = torch.zeros(len(out_embedding), 1, dtype=res_identifier.dtype, device=res_identifier.device)
-                rna_token_identifier = torch.ones(len(out_embedding), 1, dtype=res_identifier.dtype, device=res_identifier.device)
-                res_identifier = torch.cat([prot_token_identifier, rna_token_identifier, res_identifier], dim=1)
-                attn_mask[:, 1:, 1:] = (res_identifier[:, :, None] == res_identifier[:, None, :])
-            attn_mask = ~attn_mask
-            # all the ones in transformer mask means ignoring, which is different from the meaning of pos_mask !!!!
-            if torch.isnan(z).any():
-                print("Found Nan in z!")
-            output, z, _ = self.c_former(out_embedding, z, key_padding_mask=key_padding_mask, need_attn_weights=False, attn_mask=attn_mask)
-            
-            # Output Embedding: [N, E]
-            if self.pooling == 'token':
-                complex_embedding = output[:, 0, :].squeeze(1)
-                prot_embedding = output[:, 1, :].squeeze(1)
-                rna_embedding = output[:, 2, :].squeeze(1)
-            else:
-                complex_embedding = (output * (~key_padding_mask).unsqueeze(-1)).sum(dim=1)
-                prot_embedding = (output * (~key_padding_mask).unsqueeze(-1) * (1-input['identifier']).unsqueeze(-1)).sum(dim=1)
-                rna_embedding = (output * (~key_padding_mask).unsqueeze(-1) * (input['identifier'].unsqueeze(-1))).sum(dim=1)
-                if self.pooling == 'mean':
-                    cplx_mask_sum = (~key_padding_mask).sum(dim=1, keepdim=True)
-                    prot_mask_sum = ((~key_padding_mask) * (1-input['identifier'])).sum(dim=1, keepdim=True)
-                    rna_mask_sum = ((~key_padding_mask) * (input['identifier'])).sum(dim=1, keepdim=True)
-                    complex_embedding = complex_embedding / (cplx_mask_sum + 1e-10)
-                    prot_embedding = prot_embedding / (prot_mask_sum + 1e-10)
-                    rna_embedding = rna_embedding / (rna_mask_sum + 1e-10)
-                    
-            similarity = F.cosine_similarity(prot_embedding[:, None, :], rna_embedding[None, :, :], dim=2)
+        output, z, attn = self.c_former(out_embedding, z, key_padding_mask=key_padding_mask, need_attn_weights=False)
 
-            if torch.isnan(z).any():
-                print("Found Nan in z!")
-            # ------------------------------------- Atom-level distance precdiction -------------------------------------------
-            
-            output, z, _ = self.c_former(out_embedding, z, key_padding_mask=key_padding_mask, need_attn_weights=False, attn_mask=None)
-
-            if torch.isnan(z).any():
-                print("Found Nan in z!")
-
-            dist_logits = self.dist_head(z)
-            dist_logits = dist_logits[:, 3:, 3:, :]
-            # dist_prob = F.softmax(dist_logits, dim=-1)
-            return dist_logits, similarity 
-        
-        elif stage == 'mutation':
-            input['prot'] = input['prot_mut']
-            input['restype'] = input['mut_restype']
-            out_mut, z_mut, _ = self._forward(input, strategy)
-            deep = False
-            if deep:
-                out_forward = out_embedding - out_mut
-                z_forward = z - z_mut
-                
-                out_inv = out_mut - out_embedding
-                z_inv = z_mut - z
-                
-                
-                output_forward, z_forward, attn = self.c_former(out_forward, z_forward, key_padding_mask=key_padding_mask, need_attn_weights=False)
-                complex_embedding = output_forward + self.z_proj(z_forward).sum(-2) * 0.001
-                # Default to be token embeding
-                complex_embedding = complex_embedding[:, 0, :].squeeze(1)
-                
-                output_forward = self.pred_head(complex_embedding)
-                output_forward = output_forward.squeeze(1)
-                
-                output_inv, z_inv, attn = self.c_former(out_inv, z_inv, key_padding_mask=key_padding_mask, need_attn_weights=False)
-                complex_embedding_inv = output_inv + self.z_proj(z_inv).sum(-2) * 0.001
-                # Default to be token embeding
-                complex_embedding_inv = complex_embedding_inv[:, 0, :].squeeze(1)
-                
-                output_inv = self.pred_head(complex_embedding_inv)
-                output_inv = output_inv.squeeze(1)
-                
-                return output_forward, output_inv
-            else:
-                output_wild, z_wild, attn = self.c_former(out_embedding, z, key_padding_mask=key_padding_mask, need_attn_weights=False)
-                output_mut, z_mut, attn = self.c_former(out_mut, z_mut, key_padding_mask=key_padding_mask, need_attn_weights=False)
-                wild_embedding = output_wild + self.z_proj(z_wild).sum(-2) * 0.001
-                # Default to be token embeding
-                wild_embedding = wild_embedding[:, 0, :].squeeze(1)
-                mut_embedding = output_mut + self.z_proj(z_mut).sum(-2) * 0.001
-                mut_embedding = mut_embedding[:, 0, :].squeeze(1)
-                
-                
-                forward_embedding = wild_embedding - mut_embedding
-                inv_embedding = mut_embedding - wild_embedding
-                
-                output_forward = self.pred_head(forward_embedding).squeeze(1)
-                output_inv = self.pred_head(inv_embedding).squeeze(1)
-                
-                return output_forward, output_inv
-
+        complex_embedding = output + self.z_proj(z).sum(-2) * 0.001
+        if self.pooling == 'token':
+            complex_embedding = output[:, 0, :].squeeze(1)
         else:
-            raise NotImplementedError
-            
+            complex_embedding = (output * (~key_padding_mask).unsqueeze(-1)).sum(dim=1)
+            if self.pooling == 'mean':
+                # Prot_mask: [N, L]
+                seq_mask_sum = (~key_padding_mask).sum(dim=1, keepdim=True)
+                complex_embedding = complex_embedding / (seq_mask_sum + 1e-10)
 
-        
-        
-            
-            
+        output = self.pred_head(complex_embedding)
+        output = output.squeeze(1)
+        return output

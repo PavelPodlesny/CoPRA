@@ -23,7 +23,7 @@ This is the official implementation of CoPRA: Bridging Cross-domain Pretrained S
 
 
 
-CoPRA is a state-of-the-art predictor of protein-RNA binding affinity. The framework of CoPRA is based on a protein language model and an RNA-language model, with complex structure as input. The model was pre-trained on the PRI30k dataset via a bi-scope stratege and fine-tuned on PRA310. CoPRA can also be redirected to predict mutation effects, showing its strong per-structure prediction performance on mCSM_RNA dataset. Please see more details in [our paper](https://arxiv.org/abs/2409.03773).
+CoPRA is a state-of-the-art predictor of protein-RNA binding affinity. The framework of CoPRA is based on a protein language model and an RNA-language model, with complex structure as input. The model was originally pre-trained on the PRI30k dataset via a bi-scope stratege and fine-tuned on PRA310, and could also be redirected to predict mutation effects on the mCSM_RNA dataset — see [our paper](https://arxiv.org/abs/2409.03773) for those results. **This repository currently implements only the PRA310/PRA201 dG-regression finetuning/inference path** (the `pretune`/`ddG` training code and configs have been removed from `run.py`); the five-fold checkpoints below were produced by that original pretrain+finetune pipeline.
 
 Please do not hesitate to contact us or create an issue/PR if you have any questions or suggestions!
 
@@ -44,6 +44,9 @@ git clone git@github.com:lbcb-sci/RiNALMo.git
 cd RiNALMo
 pip install -e .
 ```
+
+**Step 3 (mandatory)**. CoPRA computes an interface-energy feature via a frozen InNA model at data-preparation time. Clone the InNA repository as a sibling of `CoPRA/` (i.e. `../InNA` relative to this repo) and place its checkpoint under `../InNA/model/`. The dataset configs (`config/datasets/PRA310.yml`, `PRA201.yml`) point at it via `inna_repo_path`/`inna_weights` — update those paths if you place InNA elsewhere. `naskit`, InNA's structure-parsing dependency, is already installed via `environment.yml`.
+
 ## 📖 Datasets and model weights for Protein-RNA binding affinity prediction
 Here, we first provide our proposed datasets, including PRA310, PRA201 and PRI30k together with an mCSM_RNA dataset, you can easily access them through 🤗Huggingface: [/Jesse7/CoPRA_data](https://huggingface.co/datasets/Jesse7/CoPRA_data/tree/main). The only difference between PRA201 and PRA310 are the selected samples, thus the PRA201 labels and splits are in PRA310/splits/PRA201.csv. Download these datasets and place them at `./datasets` folder.
 
@@ -67,35 +70,26 @@ The performance of 5-fold cross validation on PRA310 reaches state-of-the-art, a
 
 ## 🚀 Training on the protein-RNA datasets
 
-**Note1:** It is normal that the first epoch for training on a new dataset is relatively slow, because we need to conduct the caching procedure.
+**Note1:** Before finetuning or testing on a dataset, run the offline precache step once — it parses every structure's PDB and precomputes backbone geometry plus the InNA interface-energy map, writing one file per structure to `prepared_dir`. This is a required step, not an optimization; training/testing will fail if it hasn't been run.
+```
+python run.py precache --data_config ./config/datasets/PRA310.yml
+```
 
 **Note2:** We also support LoRA tuning and all-param tuning. For LoRA tuning, just specify `lora_tune: true` in `./config/models/copra.yml`. For all-param tuning, just specify `fix_lms: false` in `./config/models/copra.yml`.
 
 ### Run 5-fold inference on PRA310
 ```
-python run.py test dG --model_config ./config/models/copra.yml --data_config ./config/datasets/PRA310.yml --run_config ./config/runs/test_basic.yml
+python run.py test --model_config ./config/models/copra.yml --data_config ./config/datasets/PRA310.yml --run_config ./config/runs/test_basic.yml
 ```
 
 ### Run finetune on PRA310
 ```
-python run.py finetune dG --model_config ./config/models/copra.yml --data_config ./config/datasets/PRA310.yml --run_config ./config/runs/finetune_struct.yml
+python run.py finetune --model_config ./config/models/copra.yml --data_config ./config/datasets/PRA310.yml --run_config ./config/runs/finetune_struct.yml
 ```
 
 ### Run finetune on PRA201
 ```
-python run.py finetune dG --model_config ./config/models/copra.yml --data_config ./config/datasets/PRA201.yml --run_config ./config/runs/finetune_struct.yml
-```
-
-### Run Bi-scope Pre-training on PRI30k
-```
-python run.py finetune pretune --model_config ./config/models/copra.yml --data_config ./config/datasets/biolip.yml --run_config ./config/runs/pretune_struct.yml
-```
-After pretraining, you can continue to finetune on a new dataset with the finetuning scripts and the specification of ckpt for the pretrained model in config/runs/finetune_struct.yml
-
-## 🚀 Zero-shot Blind-test on the protein-RNA mutation effect datasets
-
-```
-python run.py test ddG --model_config ./config/models/copra.yml --data_config ./config/datasets/blindtest.yml --run_config ./config/runs/zero_shot_blindtest.yml
+python run.py finetune --model_config ./config/models/copra.yml --data_config ./config/datasets/PRA201.yml --run_config ./config/runs/finetune_struct.yml
 ```
 
 ## 🖌️ Citation
