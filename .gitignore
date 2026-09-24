@@ -162,6 +162,7 @@ cython_debug/
 #.idea/
 
 datasets/*
+scripts/*
 .vscode
 *.whl
 weights

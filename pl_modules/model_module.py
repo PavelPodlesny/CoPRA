@@ -40,6 +40,15 @@ class ModelModule(pl.LightningModule):
 
         self.train_loss = None
 
+    def load_init_weights(self, path):
+        """Weights-only init (no optimizer/scheduler/epoch state) from a checkpoint made by
+        scripts/adapt_checkpoint.py, whose keys are the Lightning `model.*` names. Strict."""
+        state_dict = torch.load(path, map_location='cpu')['state_dict']
+        prefix = 'model.'
+        assert all(k.startswith(prefix) for k in state_dict), 'expected Lightning "model." key prefix'
+        self.model.load_state_dict({k[len(prefix):]: v for k, v in state_dict.items()}, strict=True)
+        print('Loaded init weights from %s' % (path))
+
     def get_progress_bar_dict(self):
         tqdm_dict = super().get_progress_bar_dict()
         tqdm_dict.pop('v_num', None)

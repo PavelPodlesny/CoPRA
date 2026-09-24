@@ -1,4 +1,6 @@
 resume: null
+# Weights-only init (fresh optimizer/scheduler), e.g. ./weights/adapted/CoPRA_fold{fold}_adapted.ckpt; null = off
+init_weights: null
 model: 
   model_type: copra
   esm_type: 650M

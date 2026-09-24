@@ -231,6 +231,7 @@ class ESM2RiNALMo(nn.Module):
         pairwise_dist=input['pairwise_dist']
         pairwise_dihedral=input['pairwise_dihedral']
         interface_energy=input['interface_energy']
+        energy_mask=input['energy_mask']
 
         if self.pooling == 'token':
             mask_special = torch.zeros((len(out_embedding), 1), device=out_embedding.device, dtype=key_padding_mask.dtype)
@@ -267,8 +268,9 @@ class ESM2RiNALMo(nn.Module):
         num_special_tokens = self.pair_encoder.num_special_tokens
         if num_special_tokens > 0:
             interface_energy = F.pad(interface_energy, (num_special_tokens, 0, num_special_tokens, 0))
+            energy_mask = F.pad(energy_mask, (num_special_tokens, 0, num_special_tokens, 0))
 
-        z = self.pair_encoder(
+        z =self.pair_encoder(
             aa=aa,
             res_nb=res_nb,
             chain_nb=chain_nb,
@@ -276,6 +278,7 @@ class ESM2RiNALMo(nn.Module):
             pairwise_dist=pairwise_dist,
             pairwise_dihedral=pairwise_dihedral,
             interface_energy=interface_energy,
+            energy_mask=energy_mask,
             pos_atoms_special=pos_atoms if num_special_tokens > 0 else None,
         )
 

@@ -14,7 +14,7 @@ import os
 import pickle
 import sys
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 import torch
@@ -47,6 +47,7 @@ class ComplexData:
     pairwise_dist: torch.Tensor      # (L, L, 16) — raw backbone-atom distances
     pairwise_dihedral: torch.Tensor  # (L, L, 2)  — raw phi/psi dihedrals
     interface_energy: torch.Tensor   # (L, L) — raw InNA per-residue-pair energy
+    energy_mask: torch.Tensor        # (L, L) bool — True where InNA actually produced interface_energy
     max_prot_length: int
     max_na_length: int
     structure_id: str
@@ -99,6 +100,7 @@ class ComplexData:
             'pairwise_dist': self.pairwise_dist,
             'pairwise_dihedral': self.pairwise_dihedral,
             'interface_energy': self.interface_energy,
+            'energy_mask': self.energy_mask,
             'max_prot_length': self.max_prot_length,
             'max_na_length': self.max_na_length,
             'labels': self.label,
@@ -170,12 +172,22 @@ def compute_interface_energy_map(pdb_path, valid_prot_chains, valid_rna_chains, 
     RNA-residue pair in the complex — the same universe of pairs
     ResiduePairEncoder builds features for, no distance cutoff. Same-molecule
     entries and the diagonal are left at 0.0 (InNA has no notion of them).
-    Returns (L, L), L = identifier.shape[0]."""
+    Returns (energy_map, energy_mask, info): energy_map and energy_mask are
+    (L, L), L = identifier.shape[0]. energy_mask is True only where InNA
+    produced a value, so an uncomputed pair (left at 0.0 in energy_map) can be
+    told apart from a real energy near 0.
+    info = {'status', 'pairs_total', 'pairs_skipped'} records where zeros were
+    written as a fallback rather than computed. status is 'ok', 'naskit_failed'
+    or 'count_mismatch' (whole map left at zero); pairs_skipped counts
+    protein x RNA pairs left at zero because a residue had missing atoms or
+    was unknown to InNA."""
     import naskit as nsk
     from model.dataset import ComplexData as InNAComplexData, InNADataset, collate_fn
 
     L = identifier.shape[0]
     energy_map = torch.zeros(L, L)
+    energy_mask = torch.zeros(L, L, dtype=torch.bool)
+    info = {'status': 'ok', 'pairs_total': 0, 'pairs_skipped': 0}
 
     try:
         with nsk.pdbRead(pdb_path) as f:
@@ -204,7 +216,8 @@ def compute_interface_energy_map(pdb_path, valid_prot_chains, valid_rna_chains, 
                          for group in na_chain_groups.get(chain, []) for res in group]
     except Exception as e:
         print(f'[WARN] naskit failed to parse {pdb_path} ({e}); interface_energy left at zero')
-        return energy_map
+        info['status'] = 'naskit_failed'
+        return energy_map, energy_mask, info
 
     n_prot = int((identifier == 0).sum())
     n_rna = int((identifier == 1).sum())
@@ -212,7 +225,8 @@ def compute_interface_energy_map(pdb_path, valid_prot_chains, valid_rna_chains, 
         print(f'[WARN] naskit/BioPython residue-count mismatch for {pdb_path} '
               f'(naskit: {len(prot_residues)} prot / {len(rna_residues)} rna, '
               f'BioPython: {n_prot} prot / {n_rna} rna); interface_energy left at zero')
-        return energy_map
+        info['status'] = 'count_mismatch'
+        return energy_map, energy_mask, info
 
     def charge_map_for_residue(r):
         # InNA's RESIDUE_CHARGE_MAP uses older PDB nomenclature for RNA
@@ -253,12 +267,14 @@ def compute_interface_energy_map(pdb_path, valid_prot_chains, valid_rna_chains, 
         return InNAComplexData(atoms, charges, roles, coords, None)
 
     pairs = [(pi, ri, p, r) for pi, p in enumerate(prot_residues) for ri, r in enumerate(rna_residues)]
+    info['pairs_total'] = len(pairs)
     for start in range(0, len(pairs), batch_size):
         chunk = pairs[start:start + batch_size]
         items, idx = [], []
         for pi, ri, p, r in chunk:
             item = build_pair(p, r)
             if item is None:
+                info['pairs_skipped'] += 1
                 continue
             items.append(item)
             idx.append((pi, ri))
@@ -271,8 +287,10 @@ def compute_interface_energy_map(pdb_path, valid_prot_chains, valid_rna_chains, 
             i, j = pi, n_prot + ri
             energy_map[i, j] = e.item()
             energy_map[j, i] = e.item()
+            energy_mask[i, j] = True
+            energy_mask[j, i] = True
 
-    return energy_map
+    return energy_map, energy_mask, info
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +299,11 @@ def compute_interface_energy_map(pdb_path, valid_prot_chains, valid_rna_chains, 
 
 def prepare_complex(row, data_root, col_prot_name='PDB', col_prot_chain='Protein chains',
                      col_na_chain='RNA chains', col_label='△G(kcal/mol)',
-                     inna_model=None, atom_resolution='backbone', **kwargs) -> Optional[ComplexData]:
+                     inna_model=None, atom_resolution='backbone', device='cpu', **kwargs
+                     ) -> Tuple[Optional[ComplexData], Optional[dict]]:
+    """Returns (ComplexData, energy_info), or (None, None) if the structure can't be parsed.
+    energy_info is compute_interface_energy_map's info dict, with status
+    'inna_disabled' when no InNA model was given (all-zero energy map)."""
     structure_id = row[col_prot_name]
     prot_chains = row[col_prot_chain].split(',')
     na_chains = row[col_na_chain].split(',')
@@ -290,7 +312,7 @@ def prepare_complex(row, data_root, col_prot_name='PDB', col_prot_chain='Protein
     cplx = ComplexInput.from_path(pdb_path, valid_prot_chains=prot_chains, valid_rna_chains=na_chains)
     if cplx is None:
         print(f'[INFO] Failed to parse structure. Too few valid residues: {pdb_path}')
-        return None
+        return None, None
 
     res_nb = torch.LongTensor(cplx.res_nb)
     chain_nb = torch.LongTensor(cplx.chainid)
@@ -308,12 +330,14 @@ def prepare_complex(row, data_root, col_prot_name='PDB', col_prot_chain='Protein
     )
 
     if inna_model is not None:
-        interface_energy = compute_interface_energy_map(
-            pdb_path, prot_chains, na_chains, identifier, inna_model,
+        interface_energy, energy_mask, energy_info = compute_interface_energy_map(
+            pdb_path, prot_chains, na_chains, identifier, inna_model, device=device,
         )
     else:
         L = len(cplx.seq)
         interface_energy = torch.zeros(L, L)
+        energy_mask = torch.zeros(L, L, dtype=torch.bool)
+        energy_info ={'status': 'inna_disabled', 'pairs_total': 0, 'pairs_skipped': 0}
 
     max_prot_length = max((len(s) for s in cplx.prot_seqs), default=0)
     max_na_length = max((len(s) for s in cplx.na_seqs), default=0)
@@ -335,38 +359,68 @@ def prepare_complex(row, data_root, col_prot_name='PDB', col_prot_chain='Protein
         pairwise_dist=pairwise_dist,
         pairwise_dihedral=pairwise_dihedral,
         interface_energy=interface_energy,
+        energy_mask=energy_mask,
         max_prot_length=max_prot_length,
         max_na_length=max_na_length,
         structure_id=structure_id,
         label=float(row[col_label]),
-    )
+    ), energy_info
+
+
+def _print_energy_report(report, n_cached):
+    """Summary of where zeros were written as a fallback instead of a computed
+    InNA energy. `report` only covers structures processed in this run."""
+    print(f'\n[energy report] processed {len(report)} structures this run '
+          f'({n_cached} already cached, not audited)')
+    by_status = {}
+    for r in report:
+        by_status[r['status']] = by_status.get(r['status'], 0) + 1
+    for status, n in sorted(by_status.items()):
+        print(f'  {status}: {n}')
+    partial = [r for r in report if r['status'] == 'ok' and r['pairs_skipped'] > 0]
+    print(f'  ok but with skipped pairs: {len(partial)}')
+    for r in report:
+        if r['status'] != 'ok':
+            print(f"  [{r['status']}] {r['structure_id']}")
+    for r in partial:
+        print(f"  [partial] {r['structure_id']}: {r['pairs_skipped']}/{r['pairs_total']} pairs left at zero")
 
 
 def precache_dataset(df_path, prepared_dir, data_root=None, col_prot_name='PDB',
                       col_prot_chain='Protein chains', col_na_chain='RNA chains',
                       col_label='△G(kcal/mol)', inna_weights=None, inna_repo_path=None,
-                      atom_resolution='backbone', **kwargs):
+                      atom_resolution='backbone', device='cpu', **kwargs):
     """Walk the whole master CSV once (fold-agnostic — the same prepared
     files are reused by every fold/split) and write one ComplexData file per
-    structure under `prepared_dir`, skipping structures already present."""
+    structure under `prepared_dir`, skipping structures already present.
+    Prints a summary of zero-energy fallbacks and returns it as a list of
+    dicts (structure_id, status, pairs_total, pairs_skipped), one per
+    structure processed in this run (not those already cached)."""
     os.makedirs(prepared_dir, exist_ok=True)
     df = pd.read_csv(df_path)
 
     inna_model = None
     if inna_weights is not None:
-        inna_model = load_inna_model(inna_weights, inna_repo_path)
+        inna_model = load_inna_model(inna_weights, inna_repo_path, device=device)
 
+    report, n_cached = [], 0
     for _, row in tqdm(df.iterrows(), total=len(df)):
         structure_id = row[col_prot_name]
         out_path = os.path.join(prepared_dir, f'{structure_id}.pkl')
         if os.path.exists(out_path):
+            n_cached += 1
             continue
-        data = prepare_complex(
+        data, energy_info = prepare_complex(
             row, data_root, col_prot_name=col_prot_name, col_prot_chain=col_prot_chain,
             col_na_chain=col_na_chain, col_label=col_label, inna_model=inna_model,
-            atom_resolution=atom_resolution,
+            atom_resolution=atom_resolution, device=device,
         )
         if data is None:
             print(f'[WARN] Skipping {structure_id}: failed to parse structure')
+            report.append({'structure_id': structure_id, 'status': 'parse_failed',
+                           'pairs_total': 0, 'pairs_skipped': 0})
             continue
+        report.append({'structure_id': structure_id, **energy_info})
         data.save(out_path)
+    _print_energy_report(report, n_cached)
+    return report

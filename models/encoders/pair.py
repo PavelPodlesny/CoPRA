@@ -96,7 +96,7 @@ class ResiduePairEncoderBase(nn.Module):
         raise NotImplementedError
 
     def forward(self, aa, res_nb, chain_nb, mask_atoms, pairwise_dist, pairwise_dihedral,
-                interface_energy, pos_atoms_special=None):
+                interface_energy, energy_mask, pos_atoms_special=None):
         """
         Args:
             aa, res_nb, chain_nb    : (N, L) — L includes the special tokens
@@ -104,6 +104,7 @@ class ResiduePairEncoderBase(nn.Module):
             pairwise_dist           : (N, L - num_special_tokens, L - num_special_tokens, A*A)
             pairwise_dihedral       : (N, L - num_special_tokens, L - num_special_tokens, 2)
             interface_energy        : (N, L, L) raw InNA per-residue-pair energy, already zero-padded for the special tokens
+            energy_mask             : (N, L, L) bool, True where interface_energy was actually computed by InNA (padded False for the special tokens)
             pos_atoms_special       : (N, L, A, 3) full backbone coords, including the special tokens coords
         Returns:
             (N, L, L, feat_dim)
@@ -137,7 +138,10 @@ class ResiduePairEncoderBase(nn.Module):
         feat_dihed = self.dihedral_embed(dihed)
 
         # InNA-derived interface energy, embedded via Siren (work-stream B2/B4)
-        feat_energy = self.energy_embeder(interface_energy)  # (N, L, L, energy_embed_dim)
+        # Gate by energy_mask: pairs without a computed energy (same-molecule, special tokens, pairs InNA
+        # couldn't score) get an all-zero vector, distinct from a real energy near 0, so they add nothing
+        # to out_mlp.0 (Siren(0) is otherwise the constant sin(phase)).
+        feat_energy = self.energy_embeder(interface_energy) * energy_mask[..., None]  # (N, L, L, energy_embed_dim)
 
         # All
         feat_all = torch.cat([feat_aapair, feat_relpos, feat_dist, feat_dihed, feat_energy], dim=-1)

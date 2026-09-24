@@ -55,8 +55,9 @@ class LightningRunner(object):
             (output_dir / 'model_data.json').write_text(json.dumps(vars(self.dataset_args), indent=2))
             torch.save(best_model, str(output_dir / 'model.pt'))
     
-    def precache(self):
-        precache_dataset(**self.dataset_args)
+    def precache(self, device='cpu'):
+        # `device` (e.g. 'cuda:0') is where the frozen InNA model runs during precache
+        precache_dataset(**{**self.dataset_args, 'device': device})
 
     def select_module(self, log_dir):
         return ModelModule(output_dir=log_dir, model_args=self.model_args, data_args=self.dataset_args, run_args=self.run_args)
@@ -78,6 +79,8 @@ class LightningRunner(object):
 
             # Setup model module
             model = self.select_module(log_dir)
+            if self.model_args.get('init_weights'):
+                model.load_init_weights(self.model_args.init_weights.format(fold=k))
             # Trainer setting
             name = self.run_args.run_name + time.strftime("%Y-%m-%d-%H-%M-%S")
             if self.run_args.wandb:

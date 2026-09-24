@@ -61,7 +61,7 @@ DEFAULT_PAD_VALUES = {
     'mask_atoms': 0,
     'chain_nb': -1,
 }
-PAIRWISE_2D_KEYS = ['pairwise_dist', 'pairwise_dihedral', 'interface_energy']
+PAIRWISE_2D_KEYS = ['pairwise_dist', 'pairwise_dihedral', 'interface_energy', 'energy_mask']
 
 class CustomStructCollate(object):
     def __init__(self, strategy='separate', length_ref_key='restype', pad_values=DEFAULT_PAD_VALUES, exclude_keys=EXCLUDE_KEYS, eight=True):
