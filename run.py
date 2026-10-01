@@ -62,7 +62,17 @@ class LightningRunner(object):
     def select_module(self, log_dir):
         return ModelModule(output_dir=log_dir, model_args=self.model_args, data_args=self.dataset_args, run_args=self.run_args)
 
+    def _check_init_weights_folds(self):
+        # A fold-0 checkpoint reused for folds 1-4 has already seen those folds' val/test rows.
+        init_weights = self.model_args.get('init_weights')
+        if init_weights and self.run_args.num_folds != 1 and '{fold}' not in init_weights:
+            raise ValueError(
+                f"model_config init_weights={init_weights!r} has no '{{fold}}' placeholder but "
+                f"run_config num_folds={self.run_args.num_folds}: every fold would start from the same "
+                f"checkpoint (data leakage for all but its own fold). Set num_folds: 1 or use per-fold files.")
+
     def finetune(self):
+        self._check_init_weights_folds()
         print("Run args:", self.run_args, "\n")
         print("Model args:", self.model_args, "\n")
         print("Dataset args:", self.dataset_args, "\n")
@@ -125,9 +135,13 @@ class LightningRunner(object):
         print(results_df.describe())
 
     def test(self):
+        self._check_init_weights_folds()
         print("Args:", self.run_args, self.dataset_args, self.model_args)
-        output_dir, ckpts, gpus = (self.run_args.output_dir, self.run_args.ckpts,
+        output_dir, ckpts, gpus = (self.run_args.output_dir, self.run_args.get('ckpts'),
                                    self.run_args.gpus)
+        init_weights = self.model_args.get('init_weights')
+        if not init_weights and not ckpts:
+            raise ValueError('test needs run_config `ckpts` or model_config `init_weights`')
         run_results = []
         for k in range(self.run_args.num_folds):
             output_dir = Path(output_dir)
@@ -135,6 +149,11 @@ class LightningRunner(object):
             data_module = DataModule(dataset_args=self.dataset_args, **self.dataset_args, col_group=f'fold_{k}')
             # data_module.setup()
             model = self.select_module(log_dir)
+            if init_weights:  # weights-only file from scripts/adapt_checkpoint.py, not a Lightning checkpoint
+                model.load_init_weights(init_weights.format(fold=k))
+                ckpt_path = None
+            else:
+                ckpt_path = ckpts[k]
             logger = CSVLogger(str(log_dir))
             strategy=DDPStrategy(find_unused_parameters=True)
             # strategy.lightning_restore_optimizer = False
@@ -150,7 +169,7 @@ class LightningRunner(object):
                 strategy=strategy,
             )
 
-            _ = trainer.test(model=model, ckpt_path=ckpts[k], datamodule=data_module)
+            _ = trainer.test(model=model, ckpt_path=ckpt_path, datamodule=data_module)
             res = model.res
             run_results.append(res)
         if trainer.global_rank == 0:

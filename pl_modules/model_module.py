@@ -8,6 +8,15 @@ import pandas as pd
 import pytorch_lightning as pl
 from models import ModelRegister
 from utils.metrics import ScalarMetricAccumulator, cal_pearson, cal_spearman, cal_rmse, cal_mae, get_loss
+# Tensors that see the InNA energy features. With `train.optimizer.lr_new` set they train at that LR,
+# everything else at `lr`. out_mlp.0.weight is one tensor, so its old columns share lr_new too.
+ENERGY_PARAM_NAMES = (
+    'model.pair_encoder.energy_embeder.freq',
+    'model.pair_encoder.energy_embeder.phase',
+    'model.pair_encoder.out_mlp.0.weight',
+)
+
+
 def get_model(model_args:dict=None):
     register = ModelRegister()
     model_args_ori = {}
@@ -54,15 +63,30 @@ class ModelModule(pl.LightningModule):
         tqdm_dict.pop('v_num', None)
         return tqdm_dict
 
+    def _optimizer_params(self):
+        lr_new = self.optimizers_cfg.get('lr_new')
+        if lr_new is None:
+            return self.parameters()
+        named = dict(self.named_parameters())
+        missing = [n for n in ENERGY_PARAM_NAMES if n not in named]
+        if missing:
+            raise ValueError(f'train.optimizer.lr_new is set but these parameters do not exist: {missing}')
+        rest = [p for n, p in named.items() if n not in ENERGY_PARAM_NAMES]
+        print(f'Optimizer groups: {len(rest)} tensors at lr={self.optimizers_cfg.lr}, '
+              f'{len(ENERGY_PARAM_NAMES)} energy tensors at lr_new={lr_new}')
+        return [{'params': rest, 'lr': self.optimizers_cfg.lr},
+                {'params': [named[n] for n in ENERGY_PARAM_NAMES], 'lr': lr_new}]
+
     def configure_optimizers(self):
+        params = self._optimizer_params()
         if self.optimizers_cfg.type == 'adam':
-            optimizer = torch.optim.Adam(self.parameters(), 
-                                         lr=self.optimizers_cfg.lr, 
+            optimizer = torch.optim.Adam(params,
+                                         lr=self.optimizers_cfg.lr,
                                          betas=(self.optimizers_cfg.beta1, self.optimizers_cfg.beta2, ))
         elif self.optimizers_cfg.type == 'sgd':
-            optimizer = torch.optim.SGD(self.parameters(), lr=self.optimizers_cfg.lr)
+            optimizer = torch.optim.SGD(params, lr=self.optimizers_cfg.lr)
         elif self.optimizers_cfg.type == 'rmsprop':
-            optimizer = torch.optim.RMSprop(self.parameters(), lr=self.optimizers_cfg.lr)
+            optimizer = torch.optim.RMSprop(params, lr=self.optimizers_cfg.lr)
         else:
             raise NotImplementedError('Optimizer not supported: %s' % self.optimizers_cfg.type)
 

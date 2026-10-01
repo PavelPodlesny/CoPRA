@@ -111,14 +111,14 @@ class ComplexData:
 # Raw geometry precomputation (moved out of ResiduePairEncoder.forward)
 # ---------------------------------------------------------------------------
 
-def _compute_atom_min_dist(pos_heavyatom, mask_heavyatom):
-    L = pos_heavyatom.shape[0]
+def _compute_atom_min_dist(coords, mask):
+    L = coords.shape[0] # (L, 41, 3)
     distance_map = torch.linalg.norm(
-        pos_heavyatom[:, None, :, None, :] - pos_heavyatom[None, :, None, :, :], dim=-1, ord=2
-    ).reshape(L, L, -1)
-    mask = (mask_heavyatom[:, None, :, None] * mask_heavyatom[None, :, None, :]).reshape(L, L, -1)
+        coords[:, None, :, None, :] - coords[None, :, None, :, :], dim=-1, ord=2
+    ).reshape(L, L, -1) # (L, L, 41, 41, 3) -> (L, L, 41, 41) -> (L, L, 41*41)
+    mask = (mask[:, None, :, None] * mask[None, :, None, :]).reshape(L, L, -1) # 0 ~ missing pair
     distance_map[~mask] = torch.inf
-    return torch.min(distance_map, dim=-1)[0]
+    return torch.min(distance_map, dim=-1)[0] # (values, indices)[0] -> (L, L)
 
 
 def _compute_pairwise_geometry(pos_heavyatom, mask_heavyatom, identifier, seq, atom_resolution='backbone'):
@@ -126,21 +126,20 @@ def _compute_pairwise_geometry(pos_heavyatom, mask_heavyatom, identifier, seq, a
     as training would (same atom_resolution), then precomputes the raw
     pairwise backbone-atom distances and phi/psi dihedrals that
     ResiduePairEncoder used to compute on every forward pass."""
-    tmp = SelectAtom(resolution=atom_resolution)({
+    backbone = SelectAtom(resolution=atom_resolution)({
         'pos_heavyatom': pos_heavyatom,
         'mask_heavyatom': mask_heavyatom,
         'identifier': identifier,
         'seq': seq,
     })
-    pos_atoms = tmp['pos_atoms']  # (L, A, 3)
+    pos_atoms = backbone['pos_atoms']  # (L, A, 3)
     L = pos_atoms.shape[0]
 
-    pos_atoms_b = pos_atoms.unsqueeze(0)  # (1, L, A, 3)
     pairwise_dist = angstrom_to_nm(torch.linalg.norm(
-        pos_atoms_b[:, :, None, :, None] - pos_atoms_b[:, None, :, None, :],
+        pos_atoms[:, None, :, None] - pos_atoms[None, :, None, :],
         dim=-1, ord=2,
-    )).reshape(1, L, L, -1).squeeze(0)  # (L, L, A*A)
-    pairwise_dihedral = pairwise_dihedrals(pos_atoms_b).squeeze(0)  # (L, L, 2)
+    )).reshape(L, L, -1) # (L, L, A*A)
+    pairwise_dihedral = pairwise_dihedrals(pos_atoms.unsqueeze(0)).squeeze(0)  # (L, L, 2)
     return pairwise_dist, pairwise_dihedral
 
 
@@ -161,130 +160,49 @@ def load_inna_model(weights_path, repo_path=None, device='cpu'):
     return model
 
 
-# Modern PDB nomenclature -> InNA's (older) RESIDUE_CHARGE_MAP nomenclature,
-# for RNA backbone phosphate oxygens.
-_ATOM_NAME_ALIASES = {'O1P': 'OP1', 'O2P': 'OP2', 'O3P': 'OP3'}
-
-
-def compute_interface_energy_map(pdb_path, valid_prot_chains, valid_rna_chains, identifier,
-                                  inna_model, device='cpu', batch_size=256):
+def compute_interface_energy_map(cplx, inna_model, device='cpu', batch_size=256):
     """Raw (unembedded) InNA interaction energy for every protein-residue x
     RNA-residue pair in the complex — the same universe of pairs
     ResiduePairEncoder builds features for, no distance cutoff. Same-molecule
     entries and the diagonal are left at 0.0 (InNA has no notion of them).
+
+    Builds InNA's per-pair inputs directly from `cplx` (data/inna_helpers.py),
+    not by re-parsing the PDB via naskit — this also sidesteps naskit's own
+    chain-traversal-order and residue-numbering-gap bugs (see the historical
+    note in data/inna_helpers.py) entirely, since `cplx` already carries the
+    correctly chain-ordered, gap-safe residue layout `ComplexInput` built.
+
     Returns (energy_map, energy_mask, info): energy_map and energy_mask are
-    (L, L), L = identifier.shape[0]. energy_mask is True only where InNA
+    (L, L), L = cplx.restype.shape[0]. energy_mask is True only where InNA
     produced a value, so an uncomputed pair (left at 0.0 in energy_map) can be
     told apart from a real energy near 0.
-    info = {'status', 'pairs_total', 'pairs_skipped'} records where zeros were
-    written as a fallback rather than computed. status is 'ok', 'naskit_failed'
-    or 'count_mismatch' (whole map left at zero); pairs_skipped counts
-    protein x RNA pairs left at zero because a residue had missing atoms or
-    was unknown to InNA."""
-    import naskit as nsk
-    from model.dataset import ComplexData as InNAComplexData, InNADataset, collate_fn
+    info = {'status', 'pairs_total', 'pairs_skipped'}: status is always 'ok'
+    here (cplx already parsed successfully by the time this runs); pairs_total
+    is n_protein_residues * n_rna_residues in the whole complex, pairs_skipped
+    counts how many of those were left at zero because a residue was entirely
+    unresolved (every one of its atoms missing) or unknown to InNA -- a
+    residue with only *some* atoms missing (e.g. a truncated side chain) is
+    still scored, by design (data/inna_helpers.py's skip policy)."""
+    from model.dataset import collate_fn
+    from data.inna_helpers import complex_to_inna_pairs
 
-    L = identifier.shape[0]
+    L = cplx.restype.shape[0]
     energy_map = torch.zeros(L, L)
     energy_mask = torch.zeros(L, L, dtype=torch.bool)
-    info = {'status': 'ok', 'pairs_total': 0, 'pairs_skipped': 0}
+    n_prot = int((cplx.identifier == 0).sum())
+    n_rna = int((cplx.identifier == 1).sum())
+    info = {'status': 'ok', 'pairs_total': n_prot * n_rna, 'pairs_skipped': 0}
 
-    try:
-        with nsk.pdbRead(pdb_path) as f:
-            pdb = f.read(derive_element=True)[0]
-        # Group by chain ID first, then walk `valid_prot_chains`/`valid_rna_chains`
-        # in that explicit order — matching `ComplexInput`/`complex_merge`
-        # (data/complex.py), which builds `identifier`'s residue order the same
-        # way. naskit's own `pdb.prot_chains`/`pdb.na_chains` traversal order is
-        # just file order and is *not* guaranteed to match the CSV-specified
-        # chain order (e.g. 1JBR: CSV RNA chains "C,D,F" vs file order C,F,D) —
-        # iterating pdb.*_chains directly here would silently misalign this
-        # energy map against `identifier` for any such structure.
-        # Note: naskit splits a single chain ID into multiple discontinuous
-        # groups wherever the file has a residue-numbering gap (e.g. 4JYZ's
-        # RNA chain 'B' is 8 separate groups) — so this must *accumulate* every
-        # group sharing a chain ID, not just keep one, or residues silently
-        # go missing.
-        prot_chain_groups, na_chain_groups = {}, {}
-        for pc in pdb.prot_chains:
-            prot_chain_groups.setdefault(pc[0].chain, []).append(pc)
-        for nc in pdb.na_chains:
-            na_chain_groups.setdefault(nc[0].chain, []).append(nc)
-        prot_residues = [res for chain in valid_prot_chains
-                          for group in prot_chain_groups.get(chain, []) for res in group]
-        rna_residues = [res for chain in valid_rna_chains
-                         for group in na_chain_groups.get(chain, []) for res in group]
-    except Exception as e:
-        print(f'[WARN] naskit failed to parse {pdb_path} ({e}); interface_energy left at zero')
-        info['status'] = 'naskit_failed'
-        return energy_map, energy_mask, info
+    pairs, indices = complex_to_inna_pairs(cplx)
+    info['pairs_skipped'] = info['pairs_total'] - len(pairs)
 
-    n_prot = int((identifier == 0).sum())
-    n_rna = int((identifier == 1).sum())
-    if len(prot_residues) != n_prot or len(rna_residues) != n_rna:
-        print(f'[WARN] naskit/BioPython residue-count mismatch for {pdb_path} '
-              f'(naskit: {len(prot_residues)} prot / {len(rna_residues)} rna, '
-              f'BioPython: {n_prot} prot / {n_rna} rna); interface_energy left at zero')
-        info['status'] = 'count_mismatch'
-        return energy_map, energy_mask, info
-
-    def charge_map_for_residue(r):
-        # InNA's RESIDUE_CHARGE_MAP uses older PDB nomenclature for RNA
-        # backbone phosphate oxygens (O1P/O2P/O3P); modern PDB files (and
-        # naskit's parse of them) use OP1/OP2/OP3 instead. Resolve to
-        # whichever name is actually present on this residue.
-        base = InNADataset.RESIDUE_CHARGE_MAP.get(r.mname, {})
-        resolved = {}
-        for old_name, charge in base.items():
-            new_name = _ATOM_NAME_ALIASES.get(old_name)
-            if new_name is not None and new_name in r:
-                resolved[new_name] = charge
-            else:
-                resolved[old_name] = charge
-        return resolved
-
-    def build_pair(prot_res, rna_res):
-        natoms = prot_res.natoms + rna_res.natoms
-        atoms = torch.zeros((natoms,), dtype=torch.int32)
-        charges = torch.zeros((natoms,), dtype=torch.int32)
-        i = 0
-        try:
-            for r in (prot_res, rna_res):
-                charge_map = charge_map_for_residue(r)
-                for ca in charge_map:
-                    if ca not in r:
-                        raise ValueError(f'Atom {ca} missing in residue {r.mname}')
-                for a in r.atoms():
-                    if r.mname not in InNADataset.KNOWN_RESIDUES:
-                        raise ValueError(f'Residue {r.mname} unknown to InNA charge table')
-                    atoms[i] = InNADataset.ATOM_MAP[a.element]
-                    charges[i] = charge_map.get(a.aname, 0)
-                    i += 1
-        except (KeyError, ValueError):
-            return None
-        coords = torch.cat([torch.FloatTensor(prot_res.coords), torch.FloatTensor(rna_res.coords)], dim=0)
-        roles = torch.cat([torch.ones(prot_res.natoms).int(), 2 * torch.ones(rna_res.natoms).int()], dim=0)
-        return InNAComplexData(atoms, charges, roles, coords, None)
-
-    pairs = [(pi, ri, p, r) for pi, p in enumerate(prot_residues) for ri, r in enumerate(rna_residues)]
-    info['pairs_total'] = len(pairs)
     for start in range(0, len(pairs), batch_size):
-        chunk = pairs[start:start + batch_size]
-        items, idx = [], []
-        for pi, ri, p, r in chunk:
-            item = build_pair(p, r)
-            if item is None:
-                info['pairs_skipped'] += 1
-                continue
-            items.append(item)
-            idx.append((pi, ri))
-        if not items:
-            continue
-        batch = collate_fn(items).to(device)
+        chunk_items = pairs[start:start + batch_size]
+        chunk_idx = indices[start:start + batch_size]
+        batch = collate_fn(chunk_items).to(device)
         with torch.no_grad():
             energies = inna_model.predict(batch).energy.cpu()
-        for (pi, ri), e in zip(idx, energies):
-            i, j = pi, n_prot + ri
+        for (i, j), e in zip(chunk_idx, energies):  # (i, j) are already global row indices
             energy_map[i, j] = e.item()
             energy_map[j, i] = e.item()
             energy_mask[i, j] = True
@@ -297,17 +215,15 @@ def compute_interface_energy_map(pdb_path, valid_prot_chains, valid_rna_chains, 
 # Per-structure preparation and the precache driver
 # ---------------------------------------------------------------------------
 
-def prepare_complex(row, data_root, col_prot_name='PDB', col_prot_chain='Protein chains',
-                     col_na_chain='RNA chains', col_label='△G(kcal/mol)',
-                     inna_model=None, atom_resolution='backbone', device='cpu', **kwargs
+def prepare_complex(data_root,
+                    cplx_id, prot_chains, na_chains, energy,
+                    inna_model=None, atom_resolution='backbone', device='cpu', **kwargs
                      ) -> Tuple[Optional[ComplexData], Optional[dict]]:
     """Returns (ComplexData, energy_info), or (None, None) if the structure can't be parsed.
     energy_info is compute_interface_energy_map's info dict, with status
     'inna_disabled' when no InNA model was given (all-zero energy map)."""
-    structure_id = row[col_prot_name]
-    prot_chains = row[col_prot_chain].split(',')
-    na_chains = row[col_na_chain].split(',')
-    pdb_path = os.path.join(data_root, structure_id + '.pdb')
+
+    pdb_path = os.path.join(data_root, cplx_id + '.pdb')
 
     cplx = ComplexInput.from_path(pdb_path, valid_prot_chains=prot_chains, valid_rna_chains=na_chains)
     if cplx is None:
@@ -331,7 +247,7 @@ def prepare_complex(row, data_root, col_prot_name='PDB', col_prot_chain='Protein
 
     if inna_model is not None:
         interface_energy, energy_mask, energy_info = compute_interface_energy_map(
-            pdb_path, prot_chains, na_chains, identifier, inna_model, device=device,
+            cplx, inna_model, device=device,
         )
     else:
         L = len(cplx.seq)
@@ -362,8 +278,8 @@ def prepare_complex(row, data_root, col_prot_name='PDB', col_prot_chain='Protein
         energy_mask=energy_mask,
         max_prot_length=max_prot_length,
         max_na_length=max_na_length,
-        structure_id=structure_id,
-        label=float(row[col_label]),
+        structure_id=cplx_id,
+        label=energy,
     ), energy_info
 
 
@@ -410,10 +326,15 @@ def precache_dataset(df_path, prepared_dir, data_root=None, col_prot_name='PDB',
         if os.path.exists(out_path):
             n_cached += 1
             continue
+
+        prot_chains = row[col_prot_chain].split(',')
+        na_chains = row[col_na_chain].split(',')
+        energy = float(row[col_label])
+
         data, energy_info = prepare_complex(
-            row, data_root, col_prot_name=col_prot_name, col_prot_chain=col_prot_chain,
-            col_na_chain=col_na_chain, col_label=col_label, inna_model=inna_model,
-            atom_resolution=atom_resolution, device=device,
+            data_root,
+            cplx_id=structure_id, prot_chains=prot_chains, na_chains=na_chains, energy=energy,
+            inna_model=inna_model, atom_resolution=atom_resolution, device=device
         )
         if data is None:
             print(f'[WARN] Skipping {structure_id}: failed to parse structure')
