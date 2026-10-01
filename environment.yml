@@ -20,6 +20,7 @@ dependencies:
   - pip
   - gpustat
   - wandb
+  - mlflow
   - easydict=1.9
   - matplotlib=3.8.0
   - pytorch_geometric

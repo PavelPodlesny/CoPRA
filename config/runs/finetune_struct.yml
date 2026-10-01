@@ -7,5 +7,5 @@ gpus:
 ckpt: null
 
 run_name: 'esm2rinalmo_scratch_patch256'
-wandb: False
+logger: csv
 num_folds: 5

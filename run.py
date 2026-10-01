@@ -14,7 +14,7 @@ import time
 from easydict import EasyDict
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import CSVLogger, WandbLogger
+from pytorch_lightning.loggers import CSVLogger, WandbLogger, MLFlowLogger
 from pytorch_lightning.callbacks import TQDMProgressBar, EarlyStopping, ModelCheckpoint, ModelSummary
 from pytorch_lightning.strategies.ddp import DDPStrategy
 from pl_modules import ModelModule, DataModule
@@ -93,11 +93,18 @@ class LightningRunner(object):
                 model.load_init_weights(self.model_args.init_weights.format(fold=k))
             # Trainer setting
             name = self.run_args.run_name + time.strftime("%Y-%m-%d-%H-%M-%S")
-            if self.run_args.wandb:
+            if self.run_args.logger == 'wandb':
                 wandb.init(project='copra', name=name)
                 logger = WandbLogger()
-            else:
+            elif self.run_args.logger == 'mlflow':
+                tracking_uri = self.run_args.get('mlflow_tracking_uri')
+                if not tracking_uri:
+                    raise ValueError("run_config logger: mlflow requires `mlflow_tracking_uri` to be set ")
+                logger = MLFlowLogger(experiment_name='copra', run_name=name, tracking_uri=tracking_uri)
+            elif self.run_args.logger == 'csv':
                 logger = CSVLogger(str(log_dir))
+            else:
+                raise NotImplementedError('Logger not supported: %s' % self.run_args.logger)
             # version_dir = Path(logger_csv.log_dir)
             pl.seed_everything(self.model_args.train.seed)
             print("Successfully initialized, start trainer...")

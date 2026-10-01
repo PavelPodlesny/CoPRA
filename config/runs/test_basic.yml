@@ -10,5 +10,5 @@ ckpts:
   - ./weights/CoPRA_5fold/CoPRA_fold4.ckpt
 
 run_name: 'esm2rinalmo_test_best'
-wandb: False
+logger: csv
 num_folds: 5

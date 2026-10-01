@@ -5,5 +5,5 @@ gpus:
   - 0
 ckpt: null
 run_name: 'esm2_rinalmo_650M_clstoken'
-wandb: true
+logger: wandb
 num_folds: 5
