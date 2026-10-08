@@ -1,0 +1,7 @@
+output_dir: ./outputs/copra_inna_finetuned-init_valentina-clean-test-fold0
+gpus:
+  - 2  # edit per machine
+
+run_name: copra_inna_finetuned-init_valentina-clean-test-fold0
+logger: csv
+num_folds: 1

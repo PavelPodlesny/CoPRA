@@ -313,7 +313,7 @@ def precache_dataset(df_path, prepared_dir, data_root=None, col_prot_name='PDB',
     dicts (structure_id, status, pairs_total, pairs_skipped), one per
     structure processed in this run (not those already cached)."""
     os.makedirs(prepared_dir, exist_ok=True)
-    df = pd.read_csv(df_path)
+    df = pd.read_csv(df_path, keep_default_na=False).replace({"": None})
 
     inna_model = None
     if inna_weights is not None:
@@ -327,8 +327,13 @@ def precache_dataset(df_path, prepared_dir, data_root=None, col_prot_name='PDB',
             n_cached += 1
             continue
 
-        prot_chains = row[col_prot_chain].split(',')
-        na_chains = row[col_na_chain].split(',')
+        prot_chains = row[col_prot_chain]
+        na_chains = row[col_na_chain]
+        if prot_chains is not None:
+            prot_chains = prot_chains.split(',')
+        if na_chains is not None:
+            na_chains = na_chains.split(',')
+            
         energy = float(row[col_label])
 
         data, energy_info = prepare_complex(

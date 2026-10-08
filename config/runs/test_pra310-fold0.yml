@@ -1,0 +1,7 @@
+output_dir: ./outputs/copra_inna_zero-init_pra310-fold0_test-ckpt
+gpus:
+  - 1  # edit per machine
+
+run_name: copra_inna_zero-init_pra310-fold0_test-ckpt
+logger: csv
+num_folds: 1

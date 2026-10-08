@@ -1,0 +1,12 @@
+epochs: 100
+patience: 100
+output_dir: ./outputs/copra_inna_zero-init_pra310-fold0
+gpus:
+  - 1  # edit per machine
+
+ckpt: null
+
+run_name: copra_inna_zero-init_pra310-fold0
+logger: csv
+mlflow_tracking_uri: http://127.0.0.1:31420
+num_folds: 1
