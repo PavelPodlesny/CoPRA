@@ -163,6 +163,7 @@ cython_debug/
 
 datasets/*
 scripts/*
+config/
 .vscode
 *.whl
 weights
