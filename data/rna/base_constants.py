@@ -37,6 +37,11 @@ RNA_ATOMS = [
 ]
 
 
+# Older (AMBER-style) phosphate-oxygen names -> the names used in RNA_ATOMS.
+# Without this such atoms are silently dropped (no OP3 slot exists, so O3P is not aliased).
+RNA_ATOM_ALIASES = {'O1P': 'OP1', 'O2P': 'OP2'}
+
+
 # List of possible RNA nucleotides
 RNA_NUCLEOTIDES = [
     'A', 
