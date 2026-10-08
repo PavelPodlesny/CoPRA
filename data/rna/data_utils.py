@@ -13,8 +13,9 @@ from biotite.structure import sasa as get_sasa
 from biotite.structure import apply_residue_wise
 
 from .base_constants import (
-    RNA_ATOMS, 
-    RNA_NUCLEOTIDES, 
+    RNA_ATOMS,
+    RNA_ATOM_ALIASES,
+    RNA_NUCLEOTIDES,
     PURINES,
     PYRIMIDINES,
     FILL_VALUE
@@ -270,6 +271,7 @@ def df_to_array(
         df.z_coord -= df.z_coord.mean()
 
     num_residues = len([res.split(":")[1] for res in df.residue_id.unique()])
+    df = df.assign(atom_name=df["atom_name"].replace(RNA_ATOM_ALIASES))
     df = df.loc[df["atom_name"].isin(atoms_to_keep)]
     residue_indices = pd.factorize(np.array(df.residue_id))[0]
     atom_indices = df["atom_name"].map(lambda x: atoms_to_keep.index(x)).values.astype(np.int32)
