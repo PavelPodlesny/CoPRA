@@ -1,3 +1,4 @@
+import math
 import os
 from pathlib import Path
 import torch
@@ -102,6 +103,22 @@ class ModelModule(pl.LightningModule):
         elif self.scheduler_cfg.type == 'exp':
             scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 
                                                                gamma=self.scheduler_cfg.gamma)
+        elif self.scheduler_cfg.type == 'warmup_cosine':
+            # Multiplier on each group's base lr (keeps the lr : lr_new ratio); stepped per optimizer step.
+            warmup = self.scheduler_cfg.warmup_steps
+            total = self.scheduler_cfg.total_steps
+            start = self.scheduler_cfg.warmup_start_ratio
+            floor = self.scheduler_cfg.min_lr_ratio
+            assert 0 <= warmup < total, 'warmup_steps must be < total_steps'
+
+            def lr_lambda(step):
+                if step < warmup:
+                    return start + (1 - start) * step / warmup
+                if step >= total:
+                    return floor
+                progress = (step - warmup) / (total - warmup)
+                return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * progress))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         else:
             raise NotImplementedError('Scheduler not supported: %s' % self.scheduler_cfg.type)
 
@@ -132,6 +149,7 @@ class ModelModule(pl.LightningModule):
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
+                    "interval": 'step' if self.scheduler_cfg.type == 'warmup_cosine' else 'epoch',
                 }
             }
         return optim_dict
