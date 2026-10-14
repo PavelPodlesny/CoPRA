@@ -15,9 +15,9 @@ from easydict import EasyDict
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger, WandbLogger, MLFlowLogger
-from pytorch_lightning.callbacks import TQDMProgressBar, EarlyStopping, ModelCheckpoint, ModelSummary
+from pytorch_lightning.callbacks import TQDMProgressBar, EarlyStopping, ModelSummary, LearningRateMonitor
 from pytorch_lightning.strategies.ddp import DDPStrategy
-from pl_modules import ModelModule, DataModule
+from pl_modules import ModelModule, DataModule, ModelCheckpointWithResults
 from data.prepare import precache_dataset
 from collections import defaultdict
 
@@ -47,14 +47,6 @@ class LightningRunner(object):
         self.run_args = parse_yaml(run_config)
         init_pytorch_settings()
 
-    def save_model(self, model, output_dir, trainer):
-        print("Best Model Path:", trainer.checkpoint_callback.best_model_path)
-        module = ModelModule.load_from_checkpoint(trainer.checkpoint_callback.best_model_path)
-        if trainer.global_rank == 0:
-            best_model = module.model
-            (output_dir / 'model_data.json').write_text(json.dumps(vars(self.dataset_args), indent=2))
-            torch.save(best_model, str(output_dir / 'model.pt'))
-    
     def precache(self, device='cpu'):
         # `device` (e.g. 'cuda:0') is where the frozen InNA model runs during precache
         precache_dataset(**{**self.dataset_args, 'device': device})
@@ -117,8 +109,9 @@ class LightningRunner(object):
                 logger=logger,
                 callbacks=[
                     EarlyStopping(monitor="val_loss", mode="min", patience=self.run_args.patience, strict=False),
-                    ModelCheckpoint(dirpath=(log_dir / 'checkpoint'), filename='{epoch}-{val_loss:.3f}',
-                                    monitor="val_loss", mode="min", save_last=True, save_top_k=3),
+                    ModelCheckpointWithResults(dirpath=(log_dir / 'checkpoint'), filename='{epoch}-{val_loss:.3f}',
+                                               monitor="val_loss", mode="min", save_last=True, save_top_k=3),
+                    LearningRateMonitor(logging_interval='step'),
                 ],
                 # gradient_clip_val=self.model_args.train.max_grad_norm if self.model_args.train.max_grad_norm is not None else None,
                 # gradient_clip_algorithm='norm' if self.model_args.train.max_grad_norm is not None else None,
@@ -132,8 +125,6 @@ class LightningRunner(object):
             _ = trainer.test(model=model, ckpt_path="best", datamodule=data_module)
             res = model.res
             run_results.append(res)
-            if trainer.global_rank == 0:
-                self.save_model(model, output_dir, trainer)
         result_dir = Path(output_dir) / name
         os.makedirs(result_dir, exist_ok=True)
         with open(result_dir / 'res.json', 'w') as f:

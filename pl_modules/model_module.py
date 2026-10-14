@@ -16,6 +16,9 @@ ENERGY_PARAM_NAMES = (
     'model.pair_encoder.energy_embeder.phase',
     'model.pair_encoder.out_mlp.0.weight',
 )
+# The frozen language models.
+# Checkpoints leave them out: they are rebuilt from the pretrained weights on every ModelModule construction
+LM_PREFIXES = ('model.esm.', 'model.rinalmo.')
 
 
 def get_model(model_args:dict=None):
@@ -45,7 +48,7 @@ class ModelModule(pl.LightningModule):
         self.run_args = run_args
         self.optimizers_cfg = self.model_args.train.optimizer
         self.scheduler_cfg = self.model_args.train.scheduler
-        self.valid_it = 0
+        self.val_results = None  # predictions of the latest validation epoch, see ModelCheckpointWithResults
         self.batch_size = data_args.batch_size
 
         self.train_loss = None
@@ -56,8 +59,34 @@ class ModelModule(pl.LightningModule):
         state_dict = torch.load(path, map_location='cpu')['state_dict']
         prefix = 'model.'
         assert all(k.startswith(prefix) for k in state_dict), 'expected Lightning "model." key prefix'
-        self.model.load_state_dict({k[len(prefix):]: v for k, v in state_dict.items()}, strict=True)
+        self._fill_missing_lm_keys(state_dict)
+        self.model.load_state_dict({k[len(prefix):]: v for k, v in state_dict.items()}, strict=True) # trim 'model.' prefix
         print('Loaded init weights from %s' % (path))
+
+    def _check_lms_frozen(self):
+        trainable = [n for n, p in self.named_parameters() if n.startswith(LM_PREFIXES) and p.requires_grad]
+        if trainable:
+            raise ValueError(
+                f'checkpoints leave out the language models, but {len(trainable)} of their parameters are '
+                f'trainable (e.g. {trainable[0]}): set `fix_lms: true` and `lora_tune: false` in the model config.')
+
+    def _fill_missing_lm_keys(self, state_dict):
+        """Add this module's own (pretrained, frozen) LM weights for LM keys absent from `state_dict`,
+        so a checkpoint without LMs loads strictly. Full checkpoints keep the LM weights they contain."""
+        for k, v in self.state_dict().items(): # state from a fresh model
+            if k.startswith(LM_PREFIXES) and k not in state_dict:
+                state_dict[k] = v
+
+    def on_fit_start(self):
+        self._check_lms_frozen()  # fail now, not at the first checkpoint
+
+    def on_save_checkpoint(self, checkpoint):
+        # self._check_lms_frozen()
+        checkpoint['state_dict'] = {k: v for k, v in checkpoint['state_dict'].items()
+                                    if not k.startswith(LM_PREFIXES)}
+
+    def on_load_checkpoint(self, checkpoint):
+        self._fill_missing_lm_keys(checkpoint['state_dict'])
 
     def get_progress_bar_dict(self):
         tqdm_dict = super().get_progress_bar_dict()
@@ -198,8 +227,7 @@ class ModelModule(pl.LightningModule):
     def on_validation_epoch_end(self):
         results = pd.DataFrame(self.results)
         # print("Validation:", results)
-        if self.output_dir is not None:
-            results.to_csv(os.path.join(self.output_dir, f'results_{self.valid_it}.csv'), index=False)
+        self.val_results = results
         y_pred = np.array(results[f'y_pred'])
         y_true = np.array(results[f'y_true'])
         pearson_all = np.abs(cal_pearson(y_pred, y_true))
@@ -215,8 +243,6 @@ class ModelModule(pl.LightningModule):
     
         val_loss = rmse_all * rmse_all
         self.log('val_loss', val_loss, batch_size=self.batch_size, on_epoch=True, sync_dist=True)
-        # Trigger scheduler
-        self.valid_it += 1
         return val_loss
 
     def on_test_epoch_start(self) -> None:
