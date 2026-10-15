@@ -1,0 +1,26 @@
+# Hydra root config.
+#   python run.py task=<finetune|test|precache> [group=option ...] [key=value ...]
+#   python run.py -m model.train.optimizer.lr=1e-5,3e-5      # sweep
+# Machine-specific values (paths.root, run.gpus, ...) go in the untracked conf/local/default.yaml
+# (template: conf/local/example.yaml), or on the command line.
+defaults:
+  - _self_
+  - task: finetune
+  - model: copra-inna_pra310-tuned_plateau-LR
+  - dataset: valentina_clean_train_set
+  - run: finetune_valentina-clean
+  - optional local: default
+
+paths:
+  root: ???   # data / results root of this machine
+
+device: cpu   # precache only: where the frozen InNA model runs, e.g. cuda:0
+
+hydra:
+  job:
+    chdir: false              # keep relative paths (./weights, ./datasets, ../InNA) valid
+  run:
+    dir: ${run.output_dir}    # .hydra/ (resolved config + overrides) lands next to log_fold_*/
+  sweep:
+    dir: ${run.output_dir}
+    subdir: ${hydra.job.num}  # multirun: <run.output_dir>/<job number>/

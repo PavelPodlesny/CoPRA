@@ -1,0 +1,8 @@
+# @package _global_
+# Template for conf/local/default.yaml, which is untracked (.gitignore) and merged last, after every
+# group in conf/config.yaml. Copy this file and edit it. Command-line overrides still win.
+paths:
+  root: /path/to/COPRA   # df_path, data_root, prepared_dir and output_dir hang off this
+run:
+  gpus:
+    - 0

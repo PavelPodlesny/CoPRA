@@ -3,12 +3,14 @@ import os
 os.environ["NUMEXPR_MAX_THREADS"] = '56'
 os.environ["MKL_NUM_THREADS"] = '4'
 os.environ["OMP_NUM_THREADS"] = '4'
-import fire
+import hydra
+from hydra.core.hydra_config import HydraConfig
+from hydra.types import RunMode
+from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 import pandas as pd
 
 import numpy as np
-import yaml
 import wandb
 import time
 from easydict import EasyDict
@@ -23,15 +25,13 @@ from collections import defaultdict
 
 torch.set_num_threads(16)
 
-def parse_yaml(yaml_dir):
-    with open(yaml_dir, 'r') as f:
-        content = f.read()
-        config_dict = EasyDict(yaml.load(content, Loader=yaml.FullLoader))
-        # args = Namespace(**config_dict)
-    return config_dict
+def to_easydict(node):
+    # resolves ${...} interpolations against the whole config
+    return EasyDict(OmegaConf.to_container(node, resolve=True))
 def init_pytorch_settings():
     # Multiprocess Setting to speedup dataloader
-    torch.multiprocessing.set_start_method('forkserver')
+    # force: a multirun sweep calls this once per job in the same process
+    torch.multiprocessing.set_start_method('forkserver', force=True)
     torch.multiprocessing.set_sharing_strategy('file_system')
     # torch.set_float32_matmul_precision('high')
     torch.set_num_threads(4)
@@ -39,12 +39,11 @@ def init_pytorch_settings():
     torch.backends.cudnn.allow_tf32 = True
 
 class LightningRunner(object):
-    def __init__(self, model_config='./config/models/esm2_rinalmo.yaml', data_config='./config/datasets/rpi.yaml',
-                 run_config='./config/runs/finetune_sequence.yaml'):
+    def __init__(self, model_args, dataset_args, run_args):
         super(LightningRunner, self).__init__()
-        self.model_args = parse_yaml(model_config)
-        self.dataset_args = parse_yaml(data_config)
-        self.run_args = parse_yaml(run_config)
+        self.model_args = model_args
+        self.dataset_args = dataset_args
+        self.run_args = run_args
         init_pytorch_settings()
 
     def precache(self, device='cpu'):
@@ -175,5 +174,23 @@ class LightningRunner(object):
             print(results_df.describe())
             
 
+@hydra.main(version_base='1.3', config_path='conf', config_name='config')
+def main(cfg: DictConfig):
+    hydra_cfg = HydraConfig.get()
+    task = hydra_cfg.runtime.choices.task  # the selected conf/task/<option>: finetune | test | precache
+    # run.output_dir for a single run, <run.output_dir>/<job number> in a multirun sweep
+    output_dir = Path(hydra_cfg.runtime.output_dir)
+    if hydra_cfg.mode == RunMode.MULTIRUN and any(output_dir.glob('log_fold_*')):
+        raise FileExistsError(f'{output_dir} already has results: job numbers restart at 0 on every sweep, '
+                              f'so this one would overwrite them. Change run.output_dir.')
+    run_args = to_easydict(cfg.run)
+    run_args.output_dir = str(output_dir)
+    runner = LightningRunner(to_easydict(cfg.model), to_easydict(cfg.dataset), run_args)
+    if task == 'precache':
+        runner.precache(device=cfg.device)
+    else:
+        getattr(runner, task)()
+
+
 if __name__ == '__main__':
-    fire.Fire(LightningRunner)
+    main()

@@ -1,0 +1,5 @@
+# @package _global_
+# One option per run.py task. Each keeps its own .hydra* folder, so a later `task=test` does not
+# overwrite the config record of the finetune run in the same output_dir.
+hydra:
+  output_subdir: .hydra

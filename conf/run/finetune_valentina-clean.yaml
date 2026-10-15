@@ -1,0 +1,12 @@
+epochs: 40       # total_steps in the model config assumes 40 epochs * 59 steps
+patience: 40     # val set is only 55 points -> noisy val_loss, keep patience loose
+output_dir: ${paths.root}/results/experiments/${run.run_name}
+gpus:
+  - 0  # machine-specific: override in conf/local/default.yaml
+
+ckpt: null
+
+run_name: copra-inna_pra310-tuned_valentina-clean_tune   # also names output_dir and the logger run
+logger: mlflow
+mlflow_tracking_uri: http://127.0.0.1:31420
+num_folds: 1

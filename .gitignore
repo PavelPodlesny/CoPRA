@@ -164,6 +164,8 @@ cython_debug/
 datasets/*
 scripts/*
 config/
+conf/local/*
+!conf/local/example.yaml
 .vscode
 *.whl
 weights

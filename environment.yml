@@ -14,7 +14,6 @@ dependencies:
   - pytorch-lightning
   - pandas
   - dm-tree=0.1.7
-  - fire=0.5.0
   - numpy=1.26.4
   - scikit-learn=1.3.0
   - pip
@@ -38,4 +37,5 @@ dependencies:
     - biotite==0.41.2
     - cpdb-protein==0.2.0
     - naskit
+    - hydra-core==1.3.7
     - -i https://pypi.tuna.tsinghua.edu.cn/simple
