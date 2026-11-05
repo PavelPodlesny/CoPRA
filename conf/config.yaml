@@ -6,7 +6,7 @@
 defaults:
   - _self_
   - task: finetune
-  - model: copra-inna_pra310-tuned_plateau-LR
+  - model: copra-inna_pra310-tuned_cosineLR
   - dataset: valentina_clean_train_set
   - run: finetune_valentina-clean
   - optional local: default
